@@ -1,12 +1,20 @@
 "use client";
 
 import { useState, useRef, useCallback, useEffect, ChangeEvent } from "react";
+
+/* ─────────────────────────── types ─────────────────────────── */
 type Stage = "idle" | "countdown" | "recording" | "done";
+
+/* ─────────────────────────── constants ─────────────────────── */
 const MAX_SEC = 60;
 const COUNTDOWN = 3;
+
+/* ─────────────────────────── helpers ──────────────────────── */
 function fmt(s: number) {
   return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
 }
+
+/* ──────────────────── waveform canvas hook ─────────────────── */
 function useWaveform(canvasRef: React.RefObject<HTMLCanvasElement | null>, stream: MediaStream | null, active: boolean) {
   const animRef = useRef<number>(0);
   const analyserRef = useRef<AnalyserNode | null>(null);
@@ -51,6 +59,61 @@ function useWaveform(canvasRef: React.RefObject<HTMLCanvasElement | null>, strea
   }, [active, stream, canvasRef]);
 }
 
+/* ──────────────────── mic permission hook ───────────────────── */
+type MicPerm = "unknown" | "checking" | "granted" | "denied" | "prompted";
+
+function useMicPermission() {
+  const [perm, setPerm] = useState<MicPerm>("unknown");
+
+  // On mount: check via Permissions API if available, then proactively prompt
+  useEffect(() => {
+    let permStatus: PermissionStatus | null = null;
+
+    async function check() {
+      // 1. Try Permissions API first (non-intrusive check)
+      if (navigator.permissions) {
+        try {
+          permStatus = await navigator.permissions.query({ name: "microphone" as PermissionName });
+          if (permStatus.state === "granted") { setPerm("granted"); return; }
+          if (permStatus.state === "denied")  { setPerm("denied");  return; }
+          // "prompt" state — fall through to proactive request
+          permStatus.onchange = () => {
+            if (permStatus!.state === "granted") setPerm("granted");
+            if (permStatus!.state === "denied")  setPerm("denied");
+          };
+        } catch { /* Permissions API not supported, proceed */ }
+      }
+
+      // 2. Proactively fire getUserMedia so the browser popup appears immediately
+      setPerm("prompted");
+      try {
+        const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+        s.getTracks().forEach((t) => t.stop()); // release immediately — just wanted the grant
+        setPerm("granted");
+      } catch {
+        setPerm("denied");
+      }
+    }
+
+    check();
+    return () => { if (permStatus) permStatus.onchange = null; };
+  }, []);
+
+  const requestAgain = useCallback(async () => {
+    setPerm("prompted");
+    try {
+      const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+      s.getTracks().forEach((t) => t.stop());
+      setPerm("granted");
+    } catch {
+      setPerm("denied");
+    }
+  }, []);
+
+  return { perm, requestAgain };
+}
+
+/* ══════════════════════════ MAIN PAGE ══════════════════════════ */
 export default function ReflectionPage() {
   const [stage, setStage] = useState<Stage>("idle");
   const [elapsed, setElapsed] = useState(0);
@@ -64,6 +127,8 @@ export default function ReflectionPage() {
   const [permDenied, setPermDenied] = useState(false);
   const [submitted, setSubmitted] = useState(false);
 
+  const { perm, requestAgain } = useMicPermission();
+
   const mediaRecRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -73,7 +138,7 @@ export default function ReflectionPage() {
 
   useWaveform(canvasRef, stream, stage === "recording");
 
-
+  /* ── stop recording ── */
   const stopRecording = useCallback(() => {
     if (timerRef.current) clearInterval(timerRef.current);
     if (mediaRecRef.current?.state !== "inactive") mediaRecRef.current?.stop();
@@ -82,7 +147,7 @@ export default function ReflectionPage() {
     setStage("done");
   }, [stream]);
 
-
+  /* ── start sequence ── */
   const handleRecord = useCallback(async () => {
     if (stage === "recording") { stopRecording(); return; }
     if (stage === "done") {
@@ -258,8 +323,38 @@ export default function ReflectionPage() {
           {/* RIGHT — RECORDER CARD */}
           <div style={{ background: "rgba(255,255,255,0.04)", borderRadius: 20, border: "1px solid rgba(255,255,255,0.08)", display: "flex", flexDirection: "column", gap: 0, overflow: "hidden" }}>
 
+            {/* ── MIC PERMISSION BANNER ── */}
+            {(perm === "checking" || perm === "prompted") && (
+              <div style={{ margin: "14px 14px 0", padding: "10px 14px", borderRadius: 10, background: "rgba(234,179,8,0.08)", border: "1px solid rgba(234,179,8,0.25)", display: "flex", alignItems: "center", gap: 10 }}>
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#eab308" strokeWidth="2" strokeLinecap="round" style={{ flexShrink: 0 }}><path d="M12 2a3 3 0 0 1 3 3v7a3 3 0 0 1-6 0V5a3 3 0 0 1 3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+                <span style={{ fontSize: 12, color: "#fde68a", lineHeight: 1.4 }}>Requesting microphone access — please allow the popup in your browser…</span>
+              </div>
+            )}
+            {perm === "denied" && (
+              <div style={{ margin: "14px 14px 0", padding: "12px 14px", borderRadius: 10, background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.3)" }}>
+                <div style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#f87171" strokeWidth="2" strokeLinecap="round" style={{ flexShrink: 0, marginTop: 1 }}><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                  <div style={{ flex: 1 }}>
+                    <p style={{ fontSize: 12, color: "#fca5a5", fontWeight: 600, marginBottom: 4 }}>Microphone access blocked</p>
+                    <p style={{ fontSize: 11, color: "rgba(252,165,165,0.8)", lineHeight: 1.55, marginBottom: 8 }}>
+                      Click the <strong>🔒 lock icon</strong> in your browser address bar → <strong>Site settings</strong> → set Microphone to <strong>Allow</strong>, then reload. Or tap below to try again.
+                    </p>
+                    <button onClick={requestAgain} style={{ fontSize: 11, padding: "5px 12px", borderRadius: 6, background: "rgba(239,68,68,0.15)", border: "1px solid rgba(239,68,68,0.4)", color: "#fca5a5", cursor: "pointer", fontWeight: 500 }}>
+                      Try requesting again
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+            {perm === "granted" && (
+              <div style={{ margin: "14px 14px 0", padding: "8px 14px", borderRadius: 10, background: "rgba(34,197,94,0.07)", border: "1px solid rgba(34,197,94,0.2)", display: "flex", alignItems: "center", gap: 8 }}>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#4ade80" strokeWidth="2.5" strokeLinecap="round"><polyline points="20 6 9 17 4 12"/></svg>
+                <span style={{ fontSize: 12, color: "#86efac" }}>Microphone access granted — ready to record</span>
+              </div>
+            )}
+
             {/* Card header */}
-            <div style={{ padding: "18px 20px 14px", borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
+            <div style={{ padding: "14px 20px 14px", borderBottom: "1px solid rgba(255,255,255,0.06)", marginTop: 14 }}>
               <div className="flex items-center gap-2">
                 <div style={{ width: 8, height: 8, borderRadius: "50%", background: stage === "recording" ? "#ef4444" : stage === "done" ? "#22c55e" : "rgba(255,255,255,0.2)", boxShadow: stage === "recording" ? "0 0 0 3px rgba(239,68,68,0.2)" : "none", transition: "all 0.3s" }} />
                 <span style={{ fontSize: 13, fontWeight: 600, letterSpacing: "0.05em", textTransform: "uppercase", color: stage === "recording" ? "#ef4444" : stage === "done" ? "#22c55e" : "rgba(240,237,230,0.5)" }}>
